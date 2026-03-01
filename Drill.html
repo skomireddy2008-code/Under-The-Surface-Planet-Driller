@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Under the Surface (Hackathon v1)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0f1a; color:#e8eefc; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #wrap { display:flex; height:100%; }
+    #hud { width:320px; padding:14px; background:#0e1426; border-right:1px solid rgba(255,255,255,0.08); box-sizing:border-box; }
+    #hud h1 { margin:0 0 10px; font-size:18px; }
+    #hud .card { background:#111a33; border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:10px; margin:10px 0; }
+    #hud .row { display:flex; justify-content:space-between; gap:10px; }
+    #hud .small { font-size:12px; opacity:0.9; }
+    #hud button {
+      width:100%; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,0.15);
+      background:#1b2a57; color:#fff; cursor:pointer; font-weight:600;
+    }
+    #hud button:disabled { opacity:0.5; cursor:not-allowed; }
+    #game { flex:1; display:flex; justify-content:center; align-items:center; }
+    canvas { background:#090d16; border:1px solid rgba(255,255,255,0.10); border-radius:12px; }
+    .pill { display:inline-block; padding:3px 8px; border-radius:999px; background:rgba(255,255,255,0.08); font-size:12px; }
+    .key { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <h1>🛠 Under the Surface</h1>
+    <div class="card">
+      <div class="row"><div><span class="pill" id="planetName">Planet</span></div><div class="small" id="planetDesc"></div></div>
+      <div style="margin-top:10px" class="small">
+        Move: <span class="key">A</span><span class="key">D</span> / <span class="key">←</span><span class="key">→</span><br>
+        Drill: <span class="key">Space</span> (or hold)<br>
+        Return to ship: <span class="key">R</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row"><div>Fuel</div><div id="fuelText">--</div></div>
+      <div class="row"><div>Depth</div><div id="depthText">--</div></div>
+      <div class="row"><div>Inventory</div><div id="invText">--</div></div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:700; margin-bottom:6px;">🎯 Goals</div>
+      <div id="goalsList" class="small"></div>
+      <div style="margin-top:8px;" class="small" id="goalHint"></div>
+      <div style="margin-top:10px;">
+        <button id="launchBtn" disabled>Launch to Next Planet 🚀</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:700; margin-bottom:6px;">📦 Inventory</div>
+      <div id="invList" class="small"></div>
+      <button id="dumpBtn" style="margin-top:10px; background:#2a1b57;">Dump Cargo (for testing)</button>
+    </div>
+
+    <div class="card small">
+      Tip: Rare materials spawn deeper. If you’re stuck, drill wider first, then go down.
+    </div>
+  </div>
+
+  <div id="game">
+    <canvas id="c" width="960" height="640"></canvas>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   Under the Surface (Hackathon v1)
+   - Tile grid world (procedural per planet)
+   - Player drills tiles, collects materials, meets quotas
+   - Fuel + inventory cap + planet progression
+   ============================================================ */
+
+/* -----------------------------
+   Utility + RNG
+----------------------------- */
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function randRange(rng, a, b) { return a + rng() * (b - a); }
+function randInt(rng, a, b) { return Math.floor(randRange(rng, a, b + 1)); }
+function makeRNG(seed) {
+  // Mulberry32
+  let t = seed >>> 0;
+  return function() {
+    t += 0x6D2B79F5;
+    let x = t;
+    x = Math.imul(x ^ (x >>> 15), x | 1);
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* -----------------------------
+   Game constants
+----------------------------- */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+const TILE = 24;
+const VIEW_W = canvas.width;
+const VIEW_H = canvas.height;
+
+const GRID_W = 80;   // world width in tiles
+const GRID_H = 140;  // world height in tiles
+const SURFACE_Y = 12;
+
+const INV_CAP = 60;
+
+const COLORS = {
+  bg: "#090d16",
+  sky: "#0b1430",
+  surface: "#15203f",
+  player: "#e8eefc",
+  ship: "#a9c4ff",
+  uiText: "#e8eefc",
+  shadow: "rgba(0,0,0,0.35)",
+  outline: "rgba(255,255,255,0.12)"
+};
+
+const MAT = {
+  AIR: 0,
+  DIRT: 1,
+  ROCK: 2,
+  IRON: 3,
+  CRYSTAL: 4,
+  MAGMA: 5,
+  ICECORE: 6,
+  ALIEN: 7
+};
+
+const MAT_DEF = {
+  [MAT.AIR]:     { name:"Air",      color:"#00000000", hardness:0, value:0 },
+  [MAT.DIRT]:    { name:"Dirt",     color:"#2b2a24", hardness:1, value:1 },
+  [MAT.ROCK]:    { name:"Rock",     color:"#3a3e47", hardness:2, value:1 },
+  [MAT.IRON]:    { name:"Iron",     color:"#7c7f86", hardness:3, value:3 },
+  [MAT.CRYSTAL]: { name:"Crystal",  color:"#39d0ff", hardness:4, value:6 },
+  [MAT.MAGMA]:   { name:"Magma",    color:"#ff5a2a", hardness:5, value:10 },
+  [MAT.ICECORE]: { name:"Ice Core", color:"#9fe9ff", hardness:4, value:9 },
+  [MAT.ALIEN]:   { name:"Alien Relic", color:"#b8ff4f", hardness:6, value:15 }
+};
+
+/* -----------------------------
+   Planets
+----------------------------- */
+const PLANETS = [
+  {
+    id: "rocky-1",
+    name: "Rocky Starter World",
+    desc: "Easy terrain. Learn to drill.",
+    gravity: 1.0,
+    seed: 1337,
+    fuelMax: 150,
+    drillPower: 1.0,
+    goals: { Iron: 20, Crystal: 10 },
+    spawn: {
+      dirtTo: 36,
+      rockFrom: 22,
+      veins: [
+        { mat: MAT.IRON,     minY: 18, maxY: 100, count: 26, size: [10, 32] },
+        { mat: MAT.CRYSTAL,  minY: 32, maxY: 120, count: 14, size: [8, 22] }
+      ]
+    }
+  },
+  {
+    id: "volcanic-2",
+    name: "Volcanic Core World",
+    desc: "Hot and harder layers.",
+    gravity: 1.1,
+    seed: 9001,
+    fuelMax: 165,
+    drillPower: 1.05,
+    goals: { "Magma": 15 },
+    spawn: {
+      dirtTo: 22,
+      rockFrom: 14,
+      veins: [
+        { mat: MAT.IRON,     minY: 10, maxY: 60, count: 14, size: [6, 16] },
+        { mat: MAT.MAGMA,    minY: 40, maxY: 135, count: 18, size: [10, 30] },
+        { mat: MAT.CRYSTAL,  minY: 28, maxY: 110, count: 10, size: [6, 18] }
+      ]
+    }
+  },
+  {
+    id: "ice-3",
+    name: "Frozen Subsurface Ocean",
+    desc: "Slippery ice layers, rare cores.",
+    gravity: 0.9,
+    seed: 424242,
+    fuelMax: 180,
+    drillPower: 1.1,
+    goals: { "Ice Core": 10, "Crystal": 8 },
+    spawn: {
+      dirtTo: 16,
+      rockFrom: 12,
+      veins: [
+        { mat: MAT.CRYSTAL,  minY: 24, maxY: 90, count: 16, size: [8, 22] },
+        { mat: MAT.ICECORE,  minY: 60, maxY: 135, count: 14, size: [10, 26] }
+      ]
+    }
+  }
+];
+
+/* -----------------------------
+   World generation
+----------------------------- */
+function createWorld(planetIndex) {
+  const planet = PLANETS[planetIndex];
+  const rng = makeRNG(planet.seed + planetIndex * 101);
+
+  // grid: each cell => { mat, hpMax, hp }
+  const grid = new Array(GRID_H);
+  for (let y = 0; y < GRID_H; y++) {
+    grid[y] = new Array(GRID_W);
+    for (let x = 0; x < GRID_W; x++) {
+      let mat = MAT.AIR;
+
+      if (y >= SURFACE_Y) {
+        // base layers
+        if (y < planet.spawn.dirtTo) mat = MAT.DIRT;
+        else mat = MAT.ROCK;
+
+        // sprinkle empty pockets
+        if (rng() < 0.02 && y > SURFACE_Y + 6) mat = MAT.AIR;
+      }
+
+      const def = MAT_DEF[mat];
+      const hpMax = def.hardness <= 0 ? 0 : Math.round(def.hardness * 14);
+      grid[y][x] = { mat, hpMax, hp: hpMax };
+    }
+  }
+
+  // add veins (blobs)
+  for (const v of planet.spawn.veins) {
+    for (let i = 0; i < v.count; i++) {
+      const cx = randInt(rng, 6, GRID_W - 7);
+      const cy = randInt(rng, v.minY, v.maxY);
+      const rad = randInt(rng, v.size[0], v.size[1]);
+
+      for (let y = cy - rad; y <= cy + rad; y++) {
+        if (y < SURFACE_Y || y >= GRID_H) continue;
+        for (let x = cx - rad; x <= cx + rad; x++) {
+          if (x < 0 || x >= GRID_W) continue;
+
+          const dx = x - cx;
+          const dy = y - cy;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          const jitter = randRange(rng, -0.7, 0.7);
+          if (dist + jitter <= rad * randRange(rng, 0.55, 0.95)) {
+            // only replace solid blocks
+            if (grid[y][x].mat !== MAT.AIR) {
+              const mat = v.mat;
+              const def = MAT_DEF[mat];
+              const hpMax = Math.round(def.hardness * 14);
+              grid[y][x] = { mat, hpMax, hp: hpMax };
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return { grid, rngSeed: planet.seed };
+}
+
+/* -----------------------------
+   Player
+----------------------------- */
+function createPlayer() {
+  return {
+    x: Math.floor(GRID_W / 2),
+    y: SURFACE_Y - 2,
+    vx: 0,
+    vy: 0,
+    onGround: false,
+    fuel: 150,
+    fuelMax: 150,
+    drillPower: 1.0,
+    drillCooldown: 0,
+    inventory: {}, // name => count
+    invCount: 0
+  };
+}
+
+function invAdd(player, matId, amount=1) {
+  const name = MAT_DEF[matId].name;
+  player.inventory[name] = (player.inventory[name] || 0) + amount;
+  player.invCount += amount;
+}
+
+function invGet(player, itemName) {
+  return player.inventory[itemName] || 0;
+}
+
+/* -----------------------------
+   Game state
+----------------------------- */
+const state = {
+  planetIndex: 0,
+  planet: PLANETS[0],
+  world: null,
+  player: createPlayer(),
+  camX: 0,
+  camY: 0,
+  keys: {},
+  drillHeld: false,
+  shipX: Math.floor(GRID_W/2),
+  shipY: SURFACE_Y - 3,
+  message: "",
+  messageT: 0
+};
+
+function setMessage(text, t=2.0) {
+  state.message = text;
+  state.messageT = t;
+}
+
+/* -----------------------------
+   HUD
+----------------------------- */
+const planetNameEl = document.getElementById("planetName");
+const planetDescEl = document.getElementById("planetDesc");
+const fuelTextEl = document.getElementById("fuelText");
+const depthTextEl = document.getElementById("depthText");
+const invTextEl = document.getElementById("invText");
+const goalsListEl = document.getElementById("goalsList");
+const goalHintEl = document.getElementById("goalHint");
+const launchBtn = document.getElementById("launchBtn");
+const invListEl = document.getElementById("invList");
+const dumpBtn = document.getElementById("dumpBtn");
+
+launchBtn.addEventListener("click", () => {
+  if (!goalsMet()) return;
+  if (state.planetIndex >= PLANETS.length - 1) {
+    setMessage("Mission complete! You finished all planets.", 4);
+    return;
+  }
+  state.planetIndex++;
+  loadPlanet(state.planetIndex);
+});
+
+dumpBtn.addEventListener("click", () => {
+  state.player.inventory = {};
+  state.player.invCount = 0;
+  setMessage("Cargo dumped. (testing)", 2);
+});
+
+function goalsMet() {
+  const goals = state.planet.goals;
+  for (const k in goals) {
+    if (invGet(state.player, k) < goals[k]) return false;
+  }
+  return true;
+}
+
+function updateHUD() {
+  planetNameEl.textContent = state.planet.name;
+  planetDescEl.textContent = state.planet.id;
+
+  fuelTextEl.textContent = `${Math.floor(state.player.fuel)}/${state.player.fuelMax}`;
+  const depth = Math.max(0, state.player.y - SURFACE_Y);
+  depthTextEl.textContent = `${depth} tiles`;
+  invTextEl.textContent = `${state.player.invCount}/${INV_CAP}`;
+
+  goalsListEl.innerHTML = "";
+  const goals = state.planet.goals;
+  for (const k in goals) {
+    const have = invGet(state.player, k);
+    const need = goals[k];
+    const done = have >= need;
+    const line = document.createElement("div");
+    line.textContent = `${done ? "✅" : "⬜"} ${k}: ${have}/${need}`;
+    goalsListEl.appendChild(line);
+  }
+
+  const met = goalsMet();
+  launchBtn.disabled = !met || !isAtShip();
+  if (!isAtShip()) {
+    goalHintEl.textContent = met ? "Return to your ship to launch." : "Collect the materials to unlock launch.";
+  } else {
+    goalHintEl.textContent = met ? "Ready to launch!" : "You’re at the ship. Keep drilling for materials.";
+  }
+
+  // Inventory list
+  const entries = Object.entries(state.player.inventory).sort((a,b)=>b[1]-a[1]);
+  invListEl.innerHTML = entries.length ? "" : "(empty)";
+  for (const [name, count] of entries) {
+    const line = document.createElement("div");
+    line.textContent = `${name}: ${count}`;
+    invListEl.appendChild(line);
+  }
+}
+
+function isAtShip() {
+  return Math.abs(state.player.x - state.shipX) <= 2 && state.player.y <= SURFACE_Y - 1;
+}
+
+/* -----------------------------
+   Input
+----------------------------- */
+window.addEventListener("keydown", (e) => {
+  state.keys[e.key.toLowerCase()] = true;
+  if (e.code === "Space") state.drillHeld = true;
+
+  if (e.key.toLowerCase() === "r") {
+    // Return to ship
+    state.player.x = state.shipX;
+    state.player.y = SURFACE_Y - 2;
+    state.player.vx = 0;
+    state.player.vy = 0;
+    setMessage("Returned to ship.", 1.5);
+  }
+});
+
+window.addEventListener("keyup", (e) => {
+  state.keys[e.key.toLowerCase()] = false;
+  if (e.code === "Space") state.drillHeld = false;
+});
+
+/* -----------------------------
+   Tile helpers
+----------------------------- */
+function inBounds(x,y) { return x>=0 && x<GRID_W && y>=0 && y<GRID_H; }
+function getCell(x,y) { return inBounds(x,y) ? state.world.grid[y][x] : null; }
+function isSolid(cell) { return cell && cell.mat !== MAT.AIR; }
+
+/* -----------------------------
+   Drilling
+----------------------------- */
+function drillAt(tx, ty) {
+  if (!inBounds(tx,ty)) return;
+  const cell = getCell(tx,ty);
+  if (!cell || cell.mat === MAT.AIR) return;
+  if (state.player.invCount >= INV_CAP) {
+    setMessage("Inventory full! Return to ship (R).", 2);
+    return;
+  }
+  if (state.player.fuel <= 0) {
+    setMessage("Out of fuel! Return to ship (R).", 2);
+    return;
+  }
+
+  const def = MAT_DEF[cell.mat];
+  const power = state.player.drillPower;
+
+  // Fuel cost depends on hardness
+  const fuelCost = 0.45 + def.hardness * 0.12;
+  state.player.fuel = Math.max(0, state.player.fuel - fuelCost);
+
+  cell.hp -= Math.round(3 * power);
+  if (cell.hp <= 0) {
+    invAdd(state.player, cell.mat, 1);
+    // remove tile
+    state.world.grid[ty][tx] = { mat: MAT.AIR, hpMax:0, hp:0 };
+    // little feedback message occasionally
+    if (Math.random() < 0.05) setMessage(`Collected ${def.name}`, 1.0);
+  }
+}
+
+/* -----------------------------
+   Physics + Movement
+----------------------------- */
+function canMoveTo(nx, ny) {
+  // player occupies 1 tile for simplicity
+  const cell = getCell(nx, ny);
+  return !isSolid(cell);
+}
+
+function step(dt) {
+  const p = state.player;
+
+  // regen small fuel when at ship
+  if (isAtShip()) {
+    p.fuel = clamp(p.fuel + dt * 12, 0, p.fuelMax);
+  }
+
+  // Horizontal move
+  let ax = 0;
+  const left = state.keys["a"] || state.keys["arrowleft"];
+  const right = state.keys["d"] || state.keys["arrowright"];
+  if (left) ax -= 1;
+  if (right) ax += 1;
+
+  const speed = 7.5;
+  p.vx = lerp(p.vx, ax * speed, 0.22);
+
+  // gravity (simple)
+  const g = 18 * state.planet.gravity;
+  p.vy += g * dt;
+  p.vy = clamp(p.vy, -50, 50);
+
+  // apply movement with tile collision
+  let nx = p.x + p.vx * dt;
+  let ny = p.y + p.vy * dt;
+
+  // clamp inside world
+  nx = clamp(nx, 1, GRID_W - 2);
+  ny = clamp(ny, 0, GRID_H - 2);
+
+  // resolve collisions (tile-based)
+  // check vertical collision
+  p.onGround = false;
+  // If falling and next tile is solid, stop
+  const downCell = getCell(Math.floor(nx), Math.floor(ny) + 1);
+  if (p.vy > 0 && isSolid(downCell) && ny > Math.floor(ny)) {
+    ny = Math.floor(ny);
+    p.vy = 0;
+    p.onGround = true;
+  }
+
+  // horizontal collision: prevent entering solid blocks
+  const hereCell = getCell(Math.floor(nx), Math.floor(ny));
+  if (isSolid(hereCell)) {
+    // push back to old x
+    nx = p.x;
+    p.vx = 0;
+  }
+
+  p.x = nx;
+  p.y = ny;
+
+  // drilling
+  if (p.drillCooldown > 0) p.drillCooldown -= dt;
+
+  if (state.drillHeld && p.drillCooldown <= 0) {
+    p.drillCooldown = 0.06; // drill rate
+    // drill tile directly beneath or in front
+    const facing = (right ? 1 : left ? -1 : 0);
+    const tx = Math.floor(p.x + facing);
+    const ty = Math.floor(p.y + 1);
+    drillAt(tx, ty);
+  }
+
+  // message timer
+  if (state.messageT > 0) state.messageT -= dt;
+
+  // camera follow
+  const targetCamX = p.x * TILE - VIEW_W/2;
+  const targetCamY = p.y * TILE - VIEW_H/2;
+  state.camX = lerp(state.camX, targetCamX, 0.10);
+  state.camY = lerp(state.camY, targetCamY, 0.10);
+
+  state.camX = clamp(state.camX, 0, GRID_W*TILE - VIEW_W);
+  state.camY = clamp(state.camY, 0, GRID_H*TILE - VIEW_H);
+
+  updateHUD();
+}
+
+/* -----------------------------
+   Rendering
+----------------------------- */
+function draw() {
+  ctx.clearRect(0,0,VIEW_W,VIEW_H);
+
+  // background sky
+  ctx.fillStyle = COLORS.sky;
+  ctx.fillRect(0,0,VIEW_W,VIEW_H);
+
+  // draw tiles in view
+  const startX = Math.floor(state.camX / TILE) - 1;
+  const startY = Math.floor(state.camY / TILE) - 1;
+  const endX = startX + Math.ceil(VIEW_W / TILE) + 3;
+  const endY = startY + Math.ceil(VIEW_H / TILE) + 3;
+
+  // surface band
+  const surfScreenY = SURFACE_Y * TILE - state.camY;
+  ctx.fillStyle = COLORS.surface;
+  ctx.fillRect(0, surfScreenY, VIEW_W, 3);
+
+  for (let y = startY; y < endY; y++) {
+    if (y < 0 || y >= GRID_H) continue;
+    for (let x = startX; x < endX; x++) {
+      if (x < 0 || x >= GRID_W) continue;
+      const cell = state.world.grid[y][x];
+      if (cell.mat === MAT.AIR) continue;
+
+      const def = MAT_DEF[cell.mat];
+      const sx = x * TILE - state.camX;
+      const sy = y * TILE - state.camY;
+
+      // tile fill
+      ctx.fillStyle = def.color;
+      ctx.fillRect(sx, sy, TILE, TILE);
+
+      // subtle outline
+      ctx.strokeStyle = "rgba(255,255,255,0.06)";
+      ctx.strokeRect(sx+0.5, sy+0.5, TILE-1, TILE-1);
+
+      // hp crack indicator
+      if (cell.hpMax > 0 && cell.hp < cell.hpMax) {
+        const t = cell.hp / cell.hpMax;
+        ctx.fillStyle = "rgba(0,0,0,0.25)";
+        ctx.fillRect(sx, sy, TILE, TILE*(1-t));
+      }
+    }
+  }
+
+  // ship
+  const shipSX = state.shipX*TILE - state.camX;
+  const shipSY = state.shipY*TILE - state.camY;
+  ctx.fillStyle = COLORS.ship;
+  ctx.fillRect(shipSX-12, shipSY-18, 24, 18);
+  ctx.fillRect(shipSX-20, shipSY-8, 40, 12);
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.strokeRect(shipSX-20+0.5, shipSY-8+0.5, 40-1, 12-1);
+
+  // player
+  const p = state.player;
+  const px = p.x*TILE - state.camX;
+  const py = p.y*TILE - state.camY;
+  ctx.fillStyle = COLORS.player;
+  ctx.fillRect(px-7, py-18, 14, 18);
+  ctx.fillRect(px-10, py-12, 20, 6);
+
+  // drill direction indicator
+  ctx.globalAlpha = 0.9;
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.fillRect(px-12, py+2, 24, 3);
+  ctx.globalAlpha = 1;
+
+  // message toast
+  if (state.messageT > 0 && state.message) {
+    const a = clamp(state.messageT / 2.0, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(20, 20, 520, 38);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.strokeRect(20.5, 20.5, 520-1, 38-1);
+    ctx.fillStyle = "#e8eefc";
+    ctx.font = "14px system-ui";
+    ctx.fillText(state.message, 34, 44);
+    ctx.globalAlpha = 1;
+  }
+
+  // minimap-ish depth indicator
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillRect(VIEW_W-20, 10, 8, VIEW_H-20);
+  const t = clamp(p.y / GRID_H, 0, 1);
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.fillRect(VIEW_W-20, 10 + t*(VIEW_H-20) - 4, 8, 8);
+
+  // launch prompt
+  if (goalsMet() && isAtShip()) {
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(20, VIEW_H-62, 430, 42);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.strokeRect(20.5, VIEW_H-62+0.5, 430-1, 42-1);
+    ctx.fillStyle = "#e8eefc";
+    ctx.font = "14px system-ui";
+    ctx.fillText("Goals complete! Click 'Launch to Next Planet' in the HUD. 🚀", 34, VIEW_H-36);
+  }
+}
+
+/* -----------------------------
+   Load planet
+----------------------------- */
+function loadPlanet(index) {
+  state.planetIndex = index;
+  state.planet = PLANETS[index];
+  state.world = createWorld(index);
+
+  // reset player but keep cargo if you want (hackathon: keeping cargo is fun)
+  const oldInv = state.player.inventory;
+  const oldInvCount = state.player.invCount;
+
+  state.player = createPlayer();
+  state.player.inventory = oldInv;
+  state.player.invCount = oldInvCount;
+
+  state.player.fuelMax = state.planet.fuelMax;
+  state.player.fuel = state.planet.fuelMax;
+  state.player.drillPower = state.planet.drillPower;
+
+  state.shipX = Math.floor(GRID_W/2);
+  state.shipY = SURFACE_Y - 3;
+  state.player.x = state.shipX;
+  state.player.y = SURFACE_Y - 2;
+
+  state.camX = 0;
+  state.camY = 0;
+
+  setMessage(`Arrived at ${state.planet.name}. Drill to meet quotas!`, 3);
+  updateHUD();
+}
+
+/* -----------------------------
+   Main loop
+----------------------------- */
+let last = performance.now();
+function loop(now) {
+  const dt = clamp((now - last) / 1000, 0, 0.05);
+  last = now;
+
+  step(dt);
+  draw();
+
+  requestAnimationFrame(loop);
+}
+
+loadPlanet(0);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
